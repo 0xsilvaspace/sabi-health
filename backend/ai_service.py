@@ -21,20 +21,29 @@ def generate_health_script(user_name: str, lga: str, risk_data: dict) -> str:
 
     risks_str = ", ".join(risk_data.get("risks", []))
     prompt = f"""
-    You are 'Sabi Health', a friendly Nigerian health assistant. 
+    You are 'Sabi Health', a proactive and caring health assistant in Nigeria. 
+    Your tone should be warm, neighborly, and culturally resonant. 
     User Name: {user_name}
     LGA: {lga}
-    Risks: {risks_str}
+    Risks detected: {risks_str}
     
-    Generate a short, friendly preventive message in authentic Nigerian Pidgin/English.
-    Include specific advice based on the risks mentioned (e.g., if Lassa, mention rats/covered food. If rain/malaria, mention nets).
-    End by asking if anyone in their house has a fever.
-    Keep it under 60 words. Speak like a caring neighbor.
+    TASK: Generate a short health alert message in authentic Nigerian Pidgin (blended with English where natural).
+    
+    GUIDELINES:
+    1. Start with a friendly greeting using the user's name.
+    2. Mention that you're calling because of the high risk in {lga}.
+    3. If 'Lassa fever' is a risk, advise on covering food and keeping rats away.
+    4. If 'malaria' or 'heavy rain' is a risk, advise on using mosquito nets and clearing stagnant water.
+    5. Always end by asking: "Anybody dey sick for your house?" or "How your body dey?" to check for fever.
+    6. Keep the total length under 60 words.
+    7. Do NOT use overly formal medical jargon. Use "well well", "sharp sharp", "no gree", etc., where appropriate.
+    
+    Example vibe: "Abeg, make sure say you cover your food o, so rat no go touch am."
     """
     
     try:
         response = model.generate_content(prompt)
-        return response.text.strip()
+        return response.text.strip().replace('"', '') # Clean up quotes if any
     except Exception as e:
         print(f"Gemini Error: {e}")
         return f"Nne/Nna, Sabi Health dey call you for {lga}. Risk don high for there. Abeg stay safe!"

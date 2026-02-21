@@ -3,6 +3,7 @@ import os
 import uuid
 import httpx
 import aiofiles
+import asyncio
 from pathlib import Path
 
 YARNGPT_URL = "https://yarngpt.ai/api/v1/tts"
@@ -33,9 +34,20 @@ async def text_to_speech(text: str, voice: str = "Idera") -> str:
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(YARNGPT_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        audio_data = resp.content
+        audio_data = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(YARNGPT_URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                audio_data = resp.content
+                break
+            except Exception as e:
+                print(f"YarnGPT attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    # Final attempt failed
+                    print("⚠️ YarnGPT failed after 3 retries – returning placeholder")
+                    return "https://example.com/audio.mp3"
+                await asyncio.sleep(1)
 
     filename = f"{uuid.uuid4()}.mp3"
     file_path = AUDIO_DIR / filename

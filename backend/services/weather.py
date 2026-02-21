@@ -1,5 +1,6 @@
 # services/weather.py
 import httpx
+import asyncio
 from datetime import datetime, timedelta
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -17,13 +18,17 @@ async def get_rainfall(lat: float, lon: float) -> float:
         "timezone": "auto"
     }
     async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(OPEN_METEO_URL, params=params, timeout=10.0)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"Open-Meteo error: {e}")
-            return 0.0
+        for attempt in range(3):
+            try:
+                resp = await client.get(OPEN_METEO_URL, params=params, timeout=10.0)
+                resp.raise_for_status()
+                data = resp.json()
+                break  # Success
+            except Exception as e:
+                print(f"Open-Meteo attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    return 0.0
+                await asyncio.sleep(1) # Simple backoff
 
     # Extract hourly precipitation for the last 24 hours
     hourly = data.get("hourly", {})
