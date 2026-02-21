@@ -6,7 +6,7 @@
 
 set -e  # Exit on error
 
-BASE_URL="http://localhost:8000"
+BASE_URL="http://127.0.0.1:8000"
 
 echo "🔧 Sabi Health API Test Suite"
 echo "=============================="
@@ -66,6 +66,14 @@ print_info "Checking risk for user $USER_ID..."
 RISK_RESPONSE=$(curl -s "$BASE_URL/risk-check/$USER_ID")
 echo "$RISK_RESPONSE" | jq . 2>/dev/null || echo "$RISK_RESPONSE"
 print_success "Risk checked"
+
+# ----------------------------------------------------------------------
+# Generate message (AI Script + Audio)
+# ----------------------------------------------------------------------
+print_info "Generating health message for user $USER_ID..."
+AI_RESPONSE=$(curl -s -X POST "$BASE_URL/generate-message?user_id=$USER_ID")
+echo "$AI_RESPONSE" | jq . 2>/dev/null || echo "$AI_RESPONSE"
+print_success "AI Health message generated"
 
 # ----------------------------------------------------------------------
 # Test endpoints

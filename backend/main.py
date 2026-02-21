@@ -4,15 +4,18 @@ import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
-from data import users_db, logs_db
-from models import UserCreate, User, Log
+from data import AsyncSessionLocal, init_db
+from models import UserCreate, User, Log, DBUser, DBLog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from services import lga_coords, weather, risk, hotspots, tts
+import ai_service
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -44,26 +47,43 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
 else:
     print("⚠️ Twilio credentials missing – using simulation")
 
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    print("🚀 Database initialized")
+
+# Dependency to get DB session
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
 # ----------------------------------------------------------------------
 # Core endpoints
 # ----------------------------------------------------------------------
 @app.post("/register", response_model=User)
-def register_user(user: UserCreate):
-    new_user = User(**user.dict())
-    users_db[new_user.id] = new_user
-    return new_user
+async def register_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
+    db_user = DBUser(**user.dict())
+    db.add(db_user)
+    await db.commit()
+    await db.refresh(db_user)
+    return User.from_orm(db_user)
 
-@app.get("/users")
-def list_users():
-    return list(users_db.values())
+@app.get("/users", response_model=list[User])
+async def list_users(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBUser))
+    users = result.scalars().all()
+    return [User.from_orm(u) for u in users]
 
-@app.get("/logs")
-def get_logs():
-    return logs_db
+@app.get("/logs", response_model=list[Log])
+async def get_logs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBLog))
+    logs = result.scalars().all()
+    return [Log.from_orm(l) for l in logs]
 
 @app.get("/risk-check/{user_id}")
-async def check_user_risk(user_id: str):
-    user = users_db.get(user_id)
+async def check_user_risk(user_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBUser).where(DBUser.id == user_id))
+    user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     coords = await lga_coords.get_coordinates(user.lga)
@@ -76,19 +96,39 @@ async def check_user_risk(user_id: str):
 # ----------------------------------------------------------------------
 # Message generation (with YarnGPT)
 # ----------------------------------------------------------------------
-async def generate_health_message(lga: str, risk_level: str, rainfall: float):
+async def generate_health_message(user_name: str, lga: str, risk_level: str, rainfall: float):
     hotspot_info = hotspots.get_hotspot_info(lga)
-    disease = hotspot_info["disease"] if hotspot_info else "unknown"
-    script = f"Good evening! I see say {lga} dey inside {risk_level} risk area. "
-    if disease != "unknown":
-        script += f"We dey see {disease} for your area. "
+    risks = []
+    if hotspot_info:
+        risks.append(hotspot_info["disease"])
     if rainfall > risk.RAINFALL_THRESHOLD:
-        script += f"Heavy rain fit cause mosquito to plenty. "
-    script += "Make sure you cover your food well well, use your mosquito net, and if anybody get fever, go hospital quick quick. Anybody dey sick for your house?"
+        risks.append("malaria (heavy rain)")
+    
+    risk_data = {"risks": risks, "level": risk_level}
+    
+    # Generate script via Gemini
+    script = ai_service.generate_health_script(user_name, lga, risk_data)
 
     # Convert to speech via YarnGPT
     audio_url = await tts.text_to_speech(script, voice="Idera")
     return script, audio_url
+
+@app.post("/generate-message")
+async def generate_message(user_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBUser).where(DBUser.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    coords = await lga_coords.get_coordinates(user.lga)
+    if not coords:
+        raise HTTPException(status_code=404, detail=f"Coordinates not found for LGA: {user.lga}")
+        
+    rainfall = await weather.get_rainfall(coords[0], coords[1])
+    risk_level = risk.check_risk_for_lga(user.lga, rainfall)
+    
+    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall)
+    return {"user_id": user_id, "script": script, "audio_url": audio_url}
 
 # ----------------------------------------------------------------------
 # TwiML generator (uses audio if available)
@@ -116,8 +156,9 @@ def generate_twiml(script: str, audio_url: str = None, call_id: str = None) -> s
 # Call initiation (Twilio + simulation fallback)
 # ----------------------------------------------------------------------
 @app.post("/call-user/{user_id}")
-async def call_user(user_id: str, background_tasks: BackgroundTasks):
-    user = users_db.get(user_id)
+async def call_user(user_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBUser).where(DBUser.id == user_id))
+    user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -137,10 +178,10 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks):
         }
 
     # Generate script and audio
-    script, audio_url = await generate_health_message(user.lga, risk_level, rainfall)
+    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall)
 
     call_id = str(uuid.uuid4())
-    log_entry = Log(
+    db_log = DBLog(
         id=call_id,
         user_id=user_id,
         timestamp=datetime.utcnow().isoformat(),
@@ -148,7 +189,8 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks):
         script=script,
         response=None
     )
-    logs_db.append(log_entry)
+    db.add(db_log)
+    await db.commit()
 
     # If Twilio is available, place real call
     if twilio_client:
@@ -199,36 +241,61 @@ class UserResponse(BaseModel):
 async def record_response(
     call_id: str,
     Digits: str = Form(None),
-    payload: UserResponse = Body(None)
+    payload: UserResponse = Body(None),
+    db: AsyncSession = Depends(get_db)
 ):
+    # Fetch log entry from DB
+    result = await db.execute(select(DBLog).where(DBLog.id == call_id))
+    log_entry = result.scalar_one_or_none()
+    
+    if not log_entry:
+        if payload is not None:
+             raise HTTPException(status_code=404, detail="Call log not found")
+        else:
+             twiml_response = VoiceResponse()
+             twiml_response.say("Sorry, we couldn't find your call record.")
+             twiml_response.hangup()
+             return str(twiml_response)
+
     # Simulation mode: JSON payload
     if payload is not None:
-        for log in logs_db:
-            if log.id == call_id:
-                log.response = payload.response
-                return {"status": "ok", "message": "Response recorded"}
-        raise HTTPException(status_code=404, detail="Call log not found")
+        log_entry.response = payload.response
+        await db.commit()
+        return {"status": "ok", "message": "Response recorded"}
 
     else:
-        # Twilio webhook (form-encoded) – only reached if payload is None
+        # Twilio webhook (form-encoded)
         twiml_response = VoiceResponse()
-        log_entry = next((log for log in logs_db if log.id == call_id), None)
-        if not log_entry:
-            twiml_response.say("Sorry, we couldn't find your call record.")
-            twiml_response.hangup()
-            return str(twiml_response)
+        
+        HEALTH_CENTERS = {
+            "kano": "Kano General Hospital, Bompai Road, Kano",
+            "lagos": "Lagos Island Maternity Hospital, Campbell Street, Lagos",
+            "abuja": "Asokoro District Hospital, Binji Garden, Abuja",
+            "benue": "Federal Medical Centre, Makurdi, Benue",
+            "sokoto": "Usmanu Danfodiyo University Teaching Hospital, Sokoto",
+            "kaduna": "Barau Dikko Teaching Hospital, Lafia Road, Kaduna",
+            "maiduguri": "State Specialist Hospital, Maiduguri, Borno",
+            "enugu": "Enugu State University Teaching Hospital, Parklane, Enugu"
+        }
+        
+        # We need to fetch the user to get the LGA
+        user_result = await db.execute(select(DBUser).where(DBUser.id == log_entry.user_id))
+        user = user_result.scalar_one_or_none()
+        lga = user.lga.lower() if user else "unknown"
+        health_center = HEALTH_CENTERS.get(lga, "the nearest primary health center")
 
         if Digits == "1":
             log_entry.response = "fever"
-            health_center = "Kano General Hospital, Bompai Road, Kano"
             twiml_response.say(f"Please visit {health_center} immediately for a check-up. Stay safe.")
         elif Digits == "2":
             log_entry.response = "fine"
             twiml_response.say("Thank you. Stay safe and follow preventive measures.")
         else:
             twiml_response.say("We didn't receive a valid response. Goodbye.")
-    twiml_response.hangup()
-    return str(twiml_response)
+        
+        await db.commit()
+        twiml_response.hangup()
+        return str(twiml_response)
 
 # =====================
 
@@ -289,3 +356,7 @@ try:
     import scheduler
 except ImportError:
     print("Scheduler not found – background tasks disabled")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
