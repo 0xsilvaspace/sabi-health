@@ -1,0 +1,3 @@
+🔧 Sabi Health API Test Suite
+==============================
+[0;34mℹ️ Checking server health...[0m

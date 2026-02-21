@@ -1,16 +1,25 @@
 # scheduler.py
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import os
 import atexit
 import asyncio
 import httpx
-from data import users_db
+from data import AsyncSessionLocal
+from models import DBUser
+from sqlalchemy import select
+
+async def get_all_user_ids():
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(DBUser.id))
+        return result.scalars().all()
 
 async def check_user_and_call(user_id: str):
     """Internal async function to trigger call for a user."""
+    domain = os.getenv("DOMAIN", "http://127.0.0.1:8000")
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"http://localhost:8000/call-user/{user_id}")
+            resp = await client.post(f"{domain}/call-user/{user_id}")
             resp.raise_for_status()
             print(f"Scheduled call for user {user_id}: {resp.json()}")
         except Exception as e:
@@ -20,9 +29,13 @@ def run_scheduled_checks():
     """Wrapper to run async checks in sync scheduler thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    tasks = [check_user_and_call(uid) for uid in users_db.keys()]
-    loop.run_until_complete(asyncio.gather(*tasks))
-    loop.close()
+    try:
+        user_ids = loop.run_until_complete(get_all_user_ids())
+        tasks = [check_user_and_call(uid) for uid in user_ids]
+        if tasks:
+            loop.run_until_complete(asyncio.gather(*tasks))
+    finally:
+        loop.close()
 
 # Initialize scheduler
 scheduler = BackgroundScheduler()
