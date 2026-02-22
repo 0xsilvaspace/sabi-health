@@ -8,6 +8,13 @@ import { Input } from "@/components/ui/input";
 import { useLogSymptoms } from "@/lib/hooks";
 import { Thermometer, Wind, Brain, Battery, Send, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import dynamic from "next/dynamic";
+import { ExternalLink, MapPin, ShieldAlert, X } from "lucide-react";
+
+const HospitalMap = dynamic(() => import("./hospital-map"), { 
+  ssr: false,
+  loading: () => <div className="h-[200px] w-full bg-muted animate-pulse rounded-xl flex items-center justify-center text-xs text-muted-foreground">Loading map...</div>
+});
 
 export function SymptomTracker() {
   const logSymptoms = useLogSymptoms();
@@ -18,6 +25,8 @@ export function SymptomTracker() {
     fatigue: 0,
     notes: ""
   });
+  const [hospital, setHospital] = useState<any>(null);
+  const [userCoords, setUserCoords] = useState<{lat?: number, lon?: number}>({});
 
   const toggleSymptom = (key: keyof typeof formData) => {
     if (key === "notes") return;
@@ -27,8 +36,15 @@ export function SymptomTracker() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     logSymptoms.mutate(formData, {
-      onSuccess: () => {
-        setFormData({ fever: 0, cough: 0, headache: 0, fatigue: 0, notes: "" });
+      onSuccess: (res: any) => {
+        if (res.data.hospital) {
+          setHospital(res.data.hospital);
+          if (res.data.lat && res.data.lon) {
+            setUserCoords({ lat: res.data.lat, lon: res.data.lon });
+          }
+        } else {
+          setFormData({ fever: 0, cough: 0, headache: 0, fatigue: 0, notes: "" });
+        }
       }
     });
   };
@@ -93,7 +109,7 @@ export function SymptomTracker() {
             type="submit" 
             className="w-full h-12 rounded-2xl shadow-xl" 
             variant="premium"
-            disabled={logSymptoms.isPending}
+            disabled={logSymptoms.isPending || !!hospital}
           >
             {logSymptoms.isPending ? (
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
@@ -103,6 +119,53 @@ export function SymptomTracker() {
             Update Health Status
           </Button>
         </form>
+
+        {hospital && (
+          <div className="mt-8 pt-8 border-t border-white/10 space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold flex items-center gap-2">
+                <ShieldAlert className="w-5 h-5 text-emerald-500" />
+                Sabi Recommendation
+              </h3>
+              <Button variant="ghost" size="icon" onClick={() => setHospital(null)}>
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+
+            <Card className="p-4 bg-emerald-50 dark:bg-emerald-900/20 border-emerald-100 dark:border-emerald-800/50 rounded-2xl">
+              <p className="text-sm text-emerald-800 dark:text-emerald-300 leading-relaxed italic">
+                "{hospital.recommendation}"
+              </p>
+            </Card>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-xs font-semibold text-muted-foreground uppercase flex items-center gap-1">
+                  <MapPin className="w-3 h-3" /> Nearest Health Center
+                </span>
+                <Button 
+                  variant="link" 
+                  size="sm" 
+                  className="h-auto p-0 text-emerald-600 font-bold"
+                  onClick={() => window.open(`https://www.google.com/maps/dir/?api=1&destination=${hospital.lat},${hospital.lon}`, "_blank")}
+                >
+                  Navigate Now <ExternalLink className="w-3 h-3 ml-1" />
+                </Button>
+              </div>
+              <HospitalMap 
+                lat={hospital.lat} 
+                lon={hospital.lon} 
+                name={hospital.name} 
+                address={hospital.address} 
+                userLat={userCoords.lat}
+                userLon={userCoords.lon}
+              />
+              <p className="text-[10px] text-center text-muted-foreground">
+                {hospital.name} — {hospital.address}
+              </p>
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

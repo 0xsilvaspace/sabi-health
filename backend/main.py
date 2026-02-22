@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Depends, Body
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Form, Depends, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client
@@ -14,7 +14,7 @@ from data import AsyncSessionLocal, init_db
 from models import UserCreate, User, Log, DBUser, DBLog, SymptomLog, DBSymptom, UserResponse, LogRequest, UserLogin
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from services import lga_coords, weather, risk, hotspots, tts
+from services import lga_coords, weather, risk, hotspots, tts, health_centers
 import ai_service
 from passlib.context import CryptContext
 
@@ -150,6 +150,10 @@ async def check_user_risk(user_id: str, db: AsyncSession = Depends(get_db)):
     risk_level = risk.check_risk_for_lga(user.lga, rainfall)
     return {"user_id": user_id, "risk": risk_level, "rainfall_mm": rainfall}
 
+@app.get("/health-centers")
+async def list_health_centers():
+    return health_centers.HEALTH_CENTERS
+
 @app.get("/me/{user_id}")
 async def get_me(user_id: str, db: AsyncSession = Depends(get_db)):
     user_result = await db.execute(select(DBUser).where(DBUser.id == user_id))
@@ -201,13 +205,30 @@ async def log_symptoms(data: SymptomLog, db: AsyncSession = Depends(get_db)):
         notes=data.notes
     )
     db.add(db_symptom)
+    
+    hospital_data = None
+    if data.fever:
+        if data.lat and data.lon:
+            hospital_data = health_centers.get_closest_hospital(data.lat, data.lon)
+        else:
+            result = await db.execute(select(DBUser).where(DBUser.id == data.user_id))
+            user = result.scalar_one_or_none()
+            if user:
+                hospital_data = health_centers.get_nearest_health_center(user.lga)
+            
     await db.commit()
     await db.refresh(db_symptom)
-    return SymptomLog.from_orm(db_symptom)
+    
+    return {
+        "symptom": SymptomLog.from_orm(db_symptom),
+        "hospital": hospital_data,
+        "lat": data.lat,
+        "lon": data.lon
+    }
 
 
 
-async def generate_health_message(user_name: str, lga: str, risk_level: str, rainfall: float, personality: str = "Mama Health"):
+async def generate_health_message(user_name: str, lga: str, risk_level: str, rainfall: float, personality: str = "Mama Health", generate_audio: bool = True):
     hotspot_info = hotspots.get_hotspot_info(lga)
     risks = []
     if hotspot_info:
@@ -219,12 +240,14 @@ async def generate_health_message(user_name: str, lga: str, risk_level: str, rai
     
     script = ai_service.generate_health_script(user_name, lga, risk_data, personality)
 
-    # Convert to speech via YarnGPT
-    audio_url = await tts.text_to_speech(script, voice="Idera")
+    audio_url = None
+    if generate_audio:
+        # Convert to speech via YarnGPT
+        audio_url = await tts.text_to_speech(script, voice="Idera")
     return script, audio_url
 
 @app.post("/generate-message")
-async def generate_message(user_id: str, db: AsyncSession = Depends(get_db)):
+async def generate_message(user_id: str, generate_audio: bool = False, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DBUser).where(DBUser.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -237,7 +260,7 @@ async def generate_message(user_id: str, db: AsyncSession = Depends(get_db)):
     rainfall = await weather.get_rainfall(coords[0], coords[1])
     risk_level = risk.check_risk_for_lga(user.lga, rainfall)
     
-    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall, user.ai_personality)
+    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall, user.ai_personality, generate_audio=generate_audio)
     return {"user_id": user_id, "script": script, "audio_url": audio_url}
 
 
@@ -288,8 +311,12 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks, force: bool
             "message": f"No significant risk detected for {user.lga} (rainfall: {rainfall:.1f}mm)."
         }
 
-    # Generate script and audio
-    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall, user.ai_personality)
+    # If Twilio is available, generate audio for it (or we could use Polly exclusively)
+    # The user said "we dont have to save the audio file", so let's skip YarnGPT entirely for now
+    # and rely on Twilio Polly for real calls and Web Speech API for simulations.
+    script, audio_url = await generate_health_message(
+        user.name, user.lga, risk_level, rainfall, user.ai_personality, generate_audio=True
+    )
 
 
     call_id = str(uuid.uuid4())
@@ -348,16 +375,25 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks, force: bool
 @app.post("/respond/{call_id}")
 async def record_response(
     call_id: str,
-    Digits: str = Form(None),
-    payload: UserResponse = Body(None),
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     # Fetch log entry from DB
     result = await db.execute(select(DBLog).where(DBLog.id == call_id))
     log_entry = result.scalar_one_or_none()
     
+    # Try to parse body as JSON first (Simulation mode)
+    payload_data = None
+    is_json = False
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            payload_data = await request.json()
+            is_json = True
+        except:
+            pass
+
     if not log_entry:
-        if payload is not None:
+        if is_json:
              raise HTTPException(status_code=404, detail="Call log not found")
         else:
              twiml_response = VoiceResponse()
@@ -366,35 +402,45 @@ async def record_response(
              return str(twiml_response)
 
     # Simulation mode: JSON payload
-    if payload is not None:
-        log_entry.response = payload.response
+    if is_json and payload_data:
+        response_type = payload_data.get("response")
+        log_entry.response = response_type
+        
+        hospital_data = None
+        if response_type == "fever":
+            if payload_data.get("lat") and payload_data.get("lon"):
+                hospital_data = health_centers.get_closest_hospital(payload_data["lat"], payload_data["lon"])
+            else:
+                user_result = await db.execute(select(DBUser).where(DBUser.id == log_entry.user_id))
+                user = user_result.scalar_one_or_none()
+                if user:
+                    hospital_data = health_centers.get_nearest_health_center(user.lga)
+        
         await db.commit()
-        return {"status": "ok", "message": "Response recorded"}
+        return {
+            "status": "ok", 
+            "message": "Response recorded",
+            "hospital": hospital_data
+        }
 
     else:
         # Twilio webhook (form-encoded)
-        twiml_response = VoiceResponse()
+        form_data = await request.form()
+        Digits = form_data.get("Digits")
         
-        HEALTH_CENTERS = {
-            "kano": "Kano General Hospital, Bompai Road, Kano",
-            "lagos": "Lagos Island Maternity Hospital, Campbell Street, Lagos",
-            "abuja": "Asokoro District Hospital, Binji Garden, Abuja",
-            "benue": "Federal Medical Centre, Makurdi, Benue",
-            "sokoto": "Usmanu Danfodiyo University Teaching Hospital, Sokoto",
-            "kaduna": "Barau Dikko Teaching Hospital, Lafia Road, Kaduna",
-            "maiduguri": "State Specialist Hospital, Maiduguri, Borno",
-            "enugu": "Enugu State University Teaching Hospital, Parklane, Enugu"
-        }
+        twiml_response = VoiceResponse()
         
         # We need to fetch the user to get the LGA
         user_result = await db.execute(select(DBUser).where(DBUser.id == log_entry.user_id))
         user = user_result.scalar_one_or_none()
-        lga = user.lga.lower() if user else "unknown"
-        health_center = HEALTH_CENTERS.get(lga, "the nearest primary health center")
+        lga = user.lga if user else "unknown"
+        
+        hospital_data = health_centers.get_nearest_health_center(lga)
+        recommendation = hospital_data["recommendation"] if hospital_data else health_centers.get_default_recommendation()
 
         if Digits == "1":
             log_entry.response = "fever"
-            twiml_response.say(f"Please visit {health_center} immediately for a check-up. Stay safe.")
+            twiml_response.say(f"{recommendation} Stay safe.")
         elif Digits == "2":
             log_entry.response = "fine"
             twiml_response.say("Thank you. Stay safe and follow preventive measures.")

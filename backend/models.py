@@ -51,6 +51,11 @@ class User(UserBase):
     class Config:
         from_attributes = True
 
+class UserResponse(BaseModel):
+    response: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
 class SymptomLog(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
@@ -60,6 +65,8 @@ class SymptomLog(BaseModel):
     headache: int = 0
     fatigue: int = 0
     notes: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -75,9 +82,6 @@ class Log(BaseModel):
 
     class Config:
         from_attributes = True
-
-class UserResponse(BaseModel):
-    response: str
 
 class LogRequest(BaseModel):
     user_id: str

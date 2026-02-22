@@ -35,7 +35,25 @@ export const useLogSymptoms = () => {
       const storedUser = localStorage.getItem("sabi_user");
       if (!storedUser) throw new Error("Not logged in");
       const user = JSON.parse(storedUser);
-      return api.post("/symptoms", { ...data, user_id: user.id });
+      
+      let coords: { lat?: number; lon?: number } = { lat: undefined, lon: undefined };
+      try {
+        const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject);
+        });
+        coords = { 
+          lat: position.coords.latitude, 
+          lon: position.coords.longitude 
+        };
+      } catch (e) {
+        console.warn("Geolocation denied or failed, falling back to registered LGA");
+      }
+      
+      return api.post("/symptoms", { 
+        ...data, 
+        user_id: user.id,
+        ...coords
+      });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["me"] });

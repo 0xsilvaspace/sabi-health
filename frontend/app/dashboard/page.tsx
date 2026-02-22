@@ -4,6 +4,7 @@ import { Navigation } from "@/components/navigation";
 import { StatsGrid } from "@/components/dashboard/stats-grid";
 import { UserTable } from "@/components/dashboard/user-table";
 import { SymptomTracker } from "@/components/dashboard/symptom-tracker";
+import { MapExplorer } from "@/components/dashboard/map-explorer";
 import { Badge } from "@/components/ui/badge";
 import { HeartPulse, Calendar, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -63,7 +64,8 @@ export default function DashboardPage() {
            </div>
 
            {/* Right Col: Logs & Profile */}
-           <div className="lg:col-span-2">
+           <div className="lg:col-span-2 space-y-10">
+              <MapExplorer />
               <UserTable />
            </div>
         </div>

@@ -52,6 +52,14 @@ export interface SymptomLog {
   headache: number;
   fatigue: number;
   notes?: string;
+  lat?: number;
+  lon?: number;
+}
+
+export interface UserResponse {
+  response: string;
+  lat?: number;
+  lon?: number;
 }
 
 
