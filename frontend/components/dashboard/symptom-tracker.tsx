@@ -1,0 +1,109 @@
+"use client";
+
+import { useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { useLogSymptoms } from "@/lib/hooks";
+import { Thermometer, Wind, Brain, Battery, Send, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+export function SymptomTracker() {
+  const logSymptoms = useLogSymptoms();
+  const [formData, setFormData] = useState({
+    fever: 0,
+    cough: 0,
+    headache: 0,
+    fatigue: 0,
+    notes: ""
+  });
+
+  const toggleSymptom = (key: keyof typeof formData) => {
+    if (key === "notes") return;
+    setFormData(prev => ({ ...prev, [key]: prev[key] === 1 ? 0 : 1 }));
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    logSymptoms.mutate(formData, {
+      onSuccess: () => {
+        setFormData({ fever: 0, cough: 0, headache: 0, fatigue: 0, notes: "" });
+      }
+    });
+  };
+
+  const symptoms = [
+    { id: "fever", label: "Fever", icon: Thermometer, color: "text-red-500", bg: "bg-red-50" },
+    { id: "cough", label: "Cough", icon: Wind, color: "text-blue-500", bg: "bg-blue-50" },
+    { id: "headache", label: "Headache", icon: Brain, color: "text-purple-500", bg: "bg-purple-50" },
+    { id: "fatigue", label: "Fatigue", icon: Battery, color: "text-amber-500", bg: "bg-amber-50" },
+  ];
+
+  return (
+    <Card className="glass-morphism border-none shadow-2xl">
+      <CardHeader>
+        <CardTitle className="text-xl flex items-center gap-2">
+           <div className="h-8 w-8 rounded-lg bg-primary/10 flex items-center justify-center">
+              <Thermometer className="h-5 w-5 text-primary" />
+           </div>
+           How are you feeling today?
+        </CardTitle>
+        <CardDescription>Log your symptoms to help Sabi Guardian protect you better.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {symptoms.map((s) => {
+              const Icon = s.icon;
+              const isActive = (formData as any)[s.id] === 1;
+              return (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => toggleSymptom(s.id as any)}
+                  className={cn(
+                    "flex flex-col items-center justify-center p-4 rounded-2xl border-2 transition-all duration-300",
+                    isActive 
+                      ? "border-emerald-500 bg-emerald-50/50 shadow-inner scale-95" 
+                      : "border-transparent bg-white/5 hover:bg-white/10"
+                  )}
+                >
+                  <div className={cn("p-3 rounded-xl mb-3", isActive ? s.bg : "bg-muted")}>
+                    <Icon className={cn("h-6 w-6", isActive ? s.color : "text-muted-foreground")} />
+                  </div>
+                  <span className="text-sm font-medium">{s.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="notes">Self-Report Notes (Optional)</Label>
+            <Input
+              id="notes"
+              placeholder="e.g. Headache started this morning..."
+              value={formData.notes}
+              onChange={(e) => setFormData(prev => ({ ...prev, notes: e.target.value }))}
+              className="bg-white/5 border-white/10"
+            />
+          </div>
+
+          <Button 
+            type="submit" 
+            className="w-full h-12 rounded-2xl shadow-xl" 
+            variant="premium"
+            disabled={logSymptoms.isPending}
+          >
+            {logSymptoms.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin mr-2" />
+            ) : (
+              <Send className="h-4 w-4 mr-2" />
+            )}
+            Update Health Status
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}

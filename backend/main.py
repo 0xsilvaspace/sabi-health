@@ -11,7 +11,7 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
 from data import AsyncSessionLocal, init_db
-from models import UserCreate, User, Log, DBUser, DBLog
+from models import UserCreate, User, Log, DBUser, DBLog, SymptomLog, DBSymptom, UserResponse, LogRequest, UserLogin
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from services import lga_coords, weather, risk, hotspots, tts
@@ -71,25 +71,45 @@ async def get_db():
 # ----------------------------------------------------------------------
 @app.post("/register", response_model=User)
 async def register_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    hashed_password = get_password_hash(user.password)
-    db_user = DBUser(**user.dict(exclude={"password"}), hashed_password=hashed_password)
-    db.add(db_user)
-    await db.commit()
-    await db.refresh(db_user)
-    return User.from_orm(db_user)
+    try:
+        # Check if user already exists
+        existing_user = await db.execute(select(DBUser).where(DBUser.phone == user.phone))
+        if existing_user.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        hashed_password = get_password_hash(user.password)
+        db_user = DBUser(**user.dict(exclude={"password"}), hashed_password=hashed_password)
+        db.add(db_user)
+        await db.commit()
+        await db.refresh(db_user)
+        return User.from_orm(db_user)
+    except Exception as e:
+        await db.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        print(f"Registration error: {e}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 @app.post("/login", response_model=User)
 async def login_user(user_login: UserLogin, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBUser).where(DBUser.phone == user_login.phone))
-    user = result.scalar_one_or_none()
+    try:
+        result = await db.execute(select(DBUser).where(DBUser.phone == user_login.phone))
+        # Use scalars().all() to handle potential duplicates and avoid MultipleResultsFound
+        users = result.scalars().all()
 
-    if not user:
-        raise HTTPException(status_code=400, detail="Incorrect phone number or password")
-    
-    if not verify_password(user_login.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Incorrect phone number or password")
-    
-    return User.from_orm(user)
+        if not users:
+            raise HTTPException(status_code=401, detail="Incorrect phone number or password")
+        
+        user = users[0]
+        if not verify_password(user_login.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect phone number or password")
+        
+        return User.from_orm(user)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        print(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during login")
 
 @app.get("/profile/{user_id}", response_model=User)
 async def get_user_profile(user_id: str, db: AsyncSession = Depends(get_db)):
@@ -139,10 +159,73 @@ async def check_user_risk(user_id: str, db: AsyncSession = Depends(get_db)):
     risk_level = risk.check_risk_for_lga(user.lga, rainfall)
     return {"user_id": user_id, "risk": risk_level, "rainfall_mm": rainfall}
 
+@app.get("/me/{user_id}")
+async def get_me(user_id: str, db: AsyncSession = Depends(get_db)):
+    # Get user profile
+    user_result = await db.execute(select(DBUser).where(DBUser.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get user's specific logs
+    log_result = await db.execute(select(DBLog).where(DBLog.user_id == user_id).order_by(DBLog.timestamp.desc()))
+    logs = log_result.scalars().all()
+
+    # Get user's symptoms
+    symptom_result = await db.execute(select(DBSymptom).where(DBSymptom.user_id == user_id).order_by(DBSymptom.timestamp.desc()))
+    symptoms = symptom_result.scalars().all()
+    
+    # Calculate Daily Health Score (simplified logic)
+    # Score starts at 100, drops based on risk level and symptoms
+    base_score = 100
+    
+    # Get current risk
+    coords = await lga_coords.get_coordinates(user.lga)
+    risk_level = "LOW"
+    rainfall = 0
+    if coords:
+        rainfall = await weather.get_rainfall(coords[0], coords[1])
+        risk_level = risk.check_risk_for_lga(user.lga, rainfall)
+    
+    if risk_level == "HIGH": base_score -= 30
+    elif risk_level == "MEDIUM": base_score -= 15
+    
+    # Check latest symptoms (last 3 days)
+    recent_symptoms = symptoms[:3]
+    for s in recent_symptoms:
+        if s.fever: base_score -= 10
+        if s.cough: base_score -= 5
+    
+    return {
+        "user": User.from_orm(user),
+        "logs": [Log.from_orm(l) for l in logs],
+        "symptoms": [SymptomLog.from_orm(s) for s in symptoms],
+        "health_score": max(0, base_score),
+        "current_risk": risk_level,
+        "rainfall_mm": rainfall
+    }
+
+@app.post("/symptoms")
+async def log_symptoms(data: SymptomLog, db: AsyncSession = Depends(get_db)):
+    db_symptom = DBSymptom(
+        user_id=data.user_id,
+        timestamp=datetime.utcnow().isoformat(),
+        fever=data.fever,
+        cough=data.cough,
+        headache=data.headache,
+        fatigue=data.fatigue,
+        notes=data.notes
+    )
+    db.add(db_symptom)
+    await db.commit()
+    await db.refresh(db_symptom)
+    return SymptomLog.from_orm(db_symptom)
+
+
 # ----------------------------------------------------------------------
 # Message generation (with YarnGPT)
 # ----------------------------------------------------------------------
-async def generate_health_message(user_name: str, lga: str, risk_level: str, rainfall: float):
+async def generate_health_message(user_name: str, lga: str, risk_level: str, rainfall: float, personality: str = "Mama Health"):
     hotspot_info = hotspots.get_hotspot_info(lga)
     risks = []
     if hotspot_info:
@@ -153,7 +236,7 @@ async def generate_health_message(user_name: str, lga: str, risk_level: str, rai
     risk_data = {"risks": risks, "level": risk_level}
     
     # Generate script via Gemini
-    script = ai_service.generate_health_script(user_name, lga, risk_data)
+    script = ai_service.generate_health_script(user_name, lga, risk_data, personality)
 
     # Convert to speech via YarnGPT
     audio_url = await tts.text_to_speech(script, voice="Idera")
@@ -173,8 +256,9 @@ async def generate_message(user_id: str, db: AsyncSession = Depends(get_db)):
     rainfall = await weather.get_rainfall(coords[0], coords[1])
     risk_level = risk.check_risk_for_lga(user.lga, rainfall)
     
-    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall)
+    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall, user.ai_personality)
     return {"user_id": user_id, "script": script, "audio_url": audio_url}
+
 
 # ----------------------------------------------------------------------
 # TwiML generator (uses audio if available)
@@ -184,7 +268,7 @@ def generate_twiml(script: str, audio_url: str = None, call_id: str = None) -> s
     if audio_url:
         response.play(audio_url)
     else:
-        response.say(script, voice="Polly.Joanna", language="en-US")
+        response.say(script, voice="Polly.Amy-Neural", language="en-US")
 
     if call_id:
         gather = response.gather(
@@ -201,7 +285,7 @@ def generate_twiml(script: str, audio_url: str = None, call_id: str = None) -> s
 # ----------------------------------------------------------------------
 # Call initiation (Twilio + simulation fallback)
 # ----------------------------------------------------------------------
-@app.post("/call-user/{user_id}")
+@app.put("/call-user/{user_id}")
 async def call_user(user_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DBUser).where(DBUser.id == user_id))
     user = result.scalar_one_or_none()
@@ -224,7 +308,8 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks, db: AsyncSe
         }
 
     # Generate script and audio
-    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall)
+    script, audio_url = await generate_health_message(user.name, user.lga, risk_level, rainfall, user.ai_personality)
+
 
     call_id = str(uuid.uuid4())
     db_log = DBLog(
@@ -277,20 +362,6 @@ async def call_user(user_id: str, background_tasks: BackgroundTasks, db: AsyncSe
 # Response webhook (handles both Twilio DTMF and simulation JSON)
 # ----------------------------------------------------------------------
 
-from fastapi import Form, Body
-from pydantic import BaseModel
-
-class UserResponse(BaseModel):
-    response: str
-
-class LogRequest(BaseModel):
-    user_id: str
-    risk_type: str
-    script: str
-
-class UserLogin(BaseModel):
-    phone: int
-    password: str
 
 @app.post("/respond/{call_id}")
 async def record_response(
