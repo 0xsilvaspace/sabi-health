@@ -91,6 +91,14 @@ async def login_user(user_login: UserLogin, db: AsyncSession = Depends(get_db)):
     
     return User.from_orm(user)
 
+@app.get("/profile/{user_id}", response_model=User)
+async def get_user_profile(user_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBUser).where(DBUser.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return User.from_orm(user)
+
 @app.get("/users", response_model=list[User])
 async def list_users(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DBUser))
